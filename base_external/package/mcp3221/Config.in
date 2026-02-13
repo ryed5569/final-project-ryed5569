@@ -1,0 +1,4 @@
+config BR2_PACKAGE_MCP3221
+    bool "mcp3221 reader"
+    help
+      Small userspace tool/daemon to read MCP3221 (12-bit) over i2c-dev.

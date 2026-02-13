@@ -1,0 +1,4 @@
+#!/bin/sh
+# Load I2C modules at boot
+modprobe i2c-bcm2835 2>/dev/null || true
+modprobe i2c-dev 2>/dev/null || true
