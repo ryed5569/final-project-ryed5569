@@ -20,71 +20,86 @@
 #include <time.h>
 #include <unistd.h>
 
+/* ----------------------------- Types ----------------------------- */
+
 typedef struct {
     int bus;
     int addr;
+
+    // For displaying Vadc in UI (this is NOT the MiniPH vRef unless you set it so)
     double vref;
     unsigned period_ms;
+
     const char *db_path;
     int http_port;
 
-    // Control loop / simulation
-    unsigned ctrl_period_ms; // e.g. 100 ms
+    // Control loop period
+    unsigned ctrl_period_ms;
 } config_t;
 
 typedef struct {
     int64_t ts_unix_ms;
-    uint16_t raw12;
-    double vref;
-    double vadc;
+    uint16_t raw12;   // 0..4095
+    double vref;      // display/reference used for vadc conversion
+    double vadc;      // volts based on vref
 
-    // Sprint 3: can be simulated or real (depending on sim_enabled and calibration)
-    double ph; // NAN if unknown
-
-    int status; // 0 ok, 1 warn, 2 fault
+    double ph;        // displayed pH: simulated plant pH if sim enabled; else measured pH
+    int status;       // 0 ok, 1 warn, 2 fault
     char faults[128];
 } reading_t;
 
 typedef struct {
-    // Control enable and setpoint
     int enabled;     // 0/1
     double setpoint; // target pH
 
-    // PI controller parameters
+    // PI parameters
     double kp;
     double ki;
-    double u_max; // saturation on actuator command
-    double i_min; // integral clamp
-    double i_max; // integral clamp
+    double u_max;    // saturation on actuator command
+    double i_min;    // integral clamp
+    double i_max;    // integral clamp
 
     // State
-    double integ; // integral state
-    double u;     // last actuator output
+    double integ;
+    double u;
 
-    // Plant parameters (simple first order with drift)
-    double ph;     // plant state (simulated, or mirrored from measured when sim disabled)
-    double ph_eq;  // equilibrium pH when u = 0
-    double k_leak; // drift rate back to equilibrium (1/s)
-    double k_u;    // actuator gain (pH/s at u=1)
+    // Plant (simulated) parameters
+    double ph;       // simulated plant state; when sim disabled, mirrors measured
+    double ph_eq;    // equilibrium pH when u=0
+    double k_leak;   // 1/s
+    double k_u;      // pH/s at u=1
 
-    // Optional measurement noise
     double noise_sigma; // pH std-dev
 
-    // Simulation switch and measured pH
-    int sim_enabled; // 1 = simulated plant, 0 = use real measured pH
-    double ph_meas;  // latest measured pH (from ADC conversion), NAN if unavailable
+    int sim_enabled; // 1 = simulate plant; 0 = use measured pH
+    double ph_meas;  // latest measured pH from MiniPH conversion; NAN if unavailable
 } control_t;
 
+/*
+ * MiniPH calibration parameters, matching the Arduino reference math.
+ *
+ * SparkysWidgets MiniPH:
+ *   miliVolts = (raw/4096)*vRef*1000
+ *   temp = (((vRef*pH7Cal)/4096)*1000 - miliVolts)/opampGain
+ *   pH = 7 - (temp/pHStep)
+ */
 typedef struct {
-    int enabled;     // 0/1
-    double slope;    // pH per volt
-    double offset;   // pH at 0V
+    int enabled;          // 0/1
+    double vref_adc;      // vRef used by the MiniPH board/ADC math; typically 4.096
+    double opamp_gain;    // stage gain; typically 5.25
+    int pH7Cal;           // raw code at pH 7
+    int pH4Cal;           // raw code at pH 4
+    double pHStep;        // mV/pH after gain; typically 59.16 or computed
 } ph_cal_t;
+
+/* ----------------------------- Globals ----------------------------- */
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static reading_t g_latest;
 static control_t g_ctrl;
 static ph_cal_t g_cal;
+
+/* ----------------------------- Time helpers ----------------------------- */
 
 static int64_t now_unix_ms(void)
 {
@@ -113,6 +128,8 @@ static void msleep(unsigned ms)
     nanosleep(&ts, NULL);
 }
 
+/* ----------------------------- FS helpers ----------------------------- */
+
 static int mkdir_p(const char *dir, mode_t mode)
 {
     char tmp[256];
@@ -139,6 +156,7 @@ static double clamp(double x, double lo, double hi)
     return x;
 }
 
+/* ----------------------------- MCP3221 read ----------------------------- */
 static int read_mcp3221_raw12(int bus, int addr, uint16_t *raw12_out)
 {
     char dev[32];
@@ -158,12 +176,38 @@ static int read_mcp3221_raw12(int bus, int addr, uint16_t *raw12_out)
     if (n != 2) return -1;
 
     uint16_t v16 = ((uint16_t)buf[0] << 8) | buf[1];
-    *raw12_out = (v16 >> 4) & 0x0FFF;
+
+    
+    // Support both packings:
+    //  - left-justified 12-bit: xxxx xxxx xxxx 0000
+    //  - right-justified 12-bit: 0000 xxxx xxxx xxxx
+    //
+    // Heuristic: if low nibble is zero, treat as left-justified.
+    
+    uint16_t raw12;
+    //if ((v16 & 0x000F) == 0) raw12 = (v16 >> 4) & 0x0FFF;
+    //else raw12 = v16 & 0x0FFF;
+    raw12 = v16 & 0x0FFF;
+    
+    *raw12_out = raw12;
     return 0;
 }
 
-// pH conversion from ADC voltage (linear calibration for Sprint 3)
-static double ph_from_vadc(double v)
+/* ------------------------ MiniPH calibration math ------------------------ */
+
+static double miniph_compute_phstep(double vref_adc, int ph7_cal, int ph4_cal, double opamp_gain)
+{
+    // Arduino:
+    // pHStep = ((((vRef*(pH7Cal - pH4Cal))/4096)*1000)/opampGain)/3;
+    int d = ph7_cal - ph4_cal;
+    if (d <= 0) return NAN;
+    if (vref_adc <= 0.0 || opamp_gain <= 0.0) return NAN;
+
+    double mv = (vref_adc * (double)d / 4096.0) * 1000.0;
+    return (mv / opamp_gain) / 3.0;
+}
+
+static double ph_from_raw12_miniph(uint16_t raw12)
 {
     ph_cal_t cal;
     pthread_mutex_lock(&g_lock);
@@ -171,10 +215,28 @@ static double ph_from_vadc(double v)
     pthread_mutex_unlock(&g_lock);
 
     if (!cal.enabled) return NAN;
-    return cal.slope * v + cal.offset;
+    if (cal.vref_adc <= 0.0 || cal.opamp_gain <= 0.0) return NAN;
+
+    double step = cal.pHStep;
+    if (!(step > 0.0)) {
+        step = miniph_compute_phstep(cal.vref_adc, cal.pH7Cal, cal.pH4Cal, cal.opamp_gain);
+        if (!(step > 0.0)) return NAN;
+    }
+
+    // SparkysWidgets:
+    // milliVolts = (raw/4096)*vRef*1000
+    // temp = (((vRef*pH7Cal)/4096)*1000 - milliVolts)/opampGain
+    // pH = 7-(temp/pHStep)
+    double milliVolts = ((double)raw12 / 4096.0) * cal.vref_adc * 1000.0;
+    double mv_at_7 = ((double)cal.pH7Cal / 4096.0) * cal.vref_adc * 1000.0;
+    double temp = (mv_at_7 - milliVolts) / cal.opamp_gain;
+    double pH = 7.0 - (temp / step);
+
+    return clamp(pH, 0.0, 14.0);
 }
 
-// Box-Muller transform for approximate Gaussian noise
+/* ----------------------------- Noise ----------------------------- */
+
 static double randn01(void)
 {
     double u1 = ((double)rand() + 1.0) / ((double)RAND_MAX + 2.0);
@@ -186,7 +248,6 @@ static double randn01(void)
 
 static int db_open_only(sqlite3 **db, const char *path)
 {
-    // Ensure parent dir exists (path like /var/lib/mcp3221/mcp3221.sqlite)
     char dir[256];
     snprintf(dir, sizeof(dir), "%s", path);
     char *slash = strrchr(dir, '/');
@@ -200,16 +261,15 @@ static int db_open_only(sqlite3 **db, const char *path)
         return -1;
     }
 
-    // Wait for locks rather than failing immediately
     sqlite3_busy_timeout(*db, 2000);
     return 0;
 }
 
 static int db_schema_init_once(sqlite3 *db)
 {
-    // DELETE journal mode is the most compatible on embedded setups
     const char *sql =
         "PRAGMA journal_mode=DELETE;"
+        "PRAGMA synchronous=NORMAL;"
         "CREATE TABLE IF NOT EXISTS readings ("
         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "  ts_unix_ms INTEGER NOT NULL,"
@@ -313,15 +373,16 @@ static void *sampler_thread(void *arg)
             snprintf(r.faults, sizeof(r.faults), "i2c_read_failed");
         } else {
             r.raw12 = raw12;
-            r.vadc = ((double)raw12 * cfg->vref) / 4095.0;
+            r.vadc = ((double)raw12 * cfg->vref) / 4096.0;
         }
 
-        double phm = ph_from_vadc(r.vadc);
+        double phm = NAN;
+        if (r.status == 0) phm = ph_from_raw12_miniph(r.raw12);
 
         pthread_mutex_lock(&g_lock);
         g_ctrl.ph_meas = phm;
 
-        // Expose pH to UI/API: sim plant pH if sim enabled, otherwise measured pH
+        // Display pH: simulated plant when sim enabled; else measured pH
         r.ph = g_ctrl.sim_enabled ? g_ctrl.ph : phm;
 
         g_latest = r;
@@ -352,20 +413,19 @@ static void *control_thread(void *arg)
         int64_t ts = now_unix_ms();
 
         pthread_mutex_lock(&g_lock);
-        control_t c = g_ctrl; // copy under lock
+        control_t c = g_ctrl;
         pthread_mutex_unlock(&g_lock);
 
         // Choose measurement source
         double ph_meas = c.sim_enabled ? c.ph : c.ph_meas;
 
-        // Add noise only to the measurement signal
+        // Add noise only to measurement signal
         if (c.noise_sigma > 0.0 && !isnan(ph_meas)) {
             ph_meas += c.noise_sigma * randn01();
         }
 
         // PI compute
         if (!c.sim_enabled && isnan(ph_meas)) {
-            // No valid measured pH yet: safe behavior
             c.u = 0.0;
             c.integ *= 0.98;
         } else if (c.enabled) {
@@ -380,12 +440,9 @@ static void *control_thread(void *arg)
 
         // Plant update
         if (c.sim_enabled) {
-            // ph_dot = -k_leak*(ph - ph_eq) + k_u*u
             double ph_dot = (-c.k_leak * (c.ph - c.ph_eq)) + (c.k_u * c.u);
-            c.ph = c.ph + dt * ph_dot;
-            c.ph = clamp(c.ph, 0.0, 14.0);
+            c.ph = clamp(c.ph + dt * ph_dot, 0.0, 14.0);
         } else {
-            // In real mode, mirror plant state to measured value (if available)
             if (!isnan(c.ph_meas)) c.ph = clamp(c.ph_meas, 0.0, 14.0);
         }
 
@@ -460,7 +517,6 @@ static void build_latest_json(char *out, size_t out_sz)
 {
     reading_t r;
     control_t c;
-
     pthread_mutex_lock(&g_lock);
     r = g_latest;
     c = g_ctrl;
@@ -492,8 +548,7 @@ static void build_latest_json(char *out, size_t out_sz)
         "}"
         "}",
         ts, (long long)r.ts_unix_ms, r.raw12, r.vref, r.vadc,
-        ph_buf,
-        status_s, r.faults,
+        ph_buf, status_s, r.faults,
         c.enabled ? "true" : "false", c.setpoint, c.u, c.sim_enabled ? "true" : "false");
 }
 
@@ -534,8 +589,11 @@ static void build_control_state_json(char *out, size_t out_sz)
         "},"
         "\"cal\":{"
           "\"enabled\":%s,"
-          "\"slope\":%.6f,"
-          "\"offset\":%.6f"
+          "\"vref_adc\":%.6f,"
+          "\"opamp_gain\":%.6f,"
+          "\"pH7Cal\":%d,"
+          "\"pH4Cal\":%d,"
+          "\"pHStep\":%.6f"
         "}"
         "}",
         c.enabled ? "true" : "false", c.setpoint, c.u,
@@ -543,10 +601,12 @@ static void build_control_state_json(char *out, size_t out_sz)
         ph_meas_buf,
         c.kp, c.ki, c.u_max, c.integ, c.i_min, c.i_max,
         c.ph, c.ph_eq, c.k_leak, c.k_u, c.noise_sigma,
-        cal.enabled ? "true" : "false", cal.slope, cal.offset);
+        cal.enabled ? "true" : "false",
+        cal.vref_adc, cal.opamp_gain, cal.pH7Cal, cal.pH4Cal, cal.pHStep);
 }
 
-// Minimal query parsing: expects "...?key=value&key2=value2"
+/* ----------------------------- Query parsing ----------------------------- */
+
 static const char *query_find(const char *path, const char *key)
 {
     const char *q = strchr(path, '?');
@@ -635,7 +695,6 @@ static void serve_client(int cfd)
         return;
     }
 
-    // /api/v1/control/enable?enabled=0|1
     if (strcmp(path_only, "/api/v1/control/enable") == 0) {
         int en = 0;
         if (parse_int_param(path, "enabled", &en) != 0) {
@@ -652,7 +711,6 @@ static void serve_client(int cfd)
         return;
     }
 
-    // /api/v1/control/setpoint?value=6.5
     if (strcmp(path_only, "/api/v1/control/setpoint") == 0) {
         double sp = 0.0;
         if (parse_double_param(path, "value", &sp) != 0) {
@@ -673,7 +731,6 @@ static void serve_client(int cfd)
         return;
     }
 
-    // /api/v1/control/tune?kp=2.0&ki=0.5&umax=0.4
     if (strcmp(path_only, "/api/v1/control/tune") == 0) {
         double kp = 0.0, ki = 0.0, umax = 0.0;
         int have = 0;
@@ -701,7 +758,6 @@ static void serve_client(int cfd)
         return;
     }
 
-    // /api/v1/control/plant?pHeq=7.5&kleak=0.05&ku=0.2&noise=0.01
     if (strcmp(path_only, "/api/v1/control/plant") == 0) {
         double pheq = 0.0, kleak = 0.0, ku = 0.0, noise = 0.0;
         int have = 0;
@@ -733,7 +789,6 @@ static void serve_client(int cfd)
         return;
     }
 
-    // NEW: /api/v1/control/sim?enabled=0|1
     if (strcmp(path_only, "/api/v1/control/sim") == 0) {
         int en = 0;
         if (parse_int_param(path, "enabled", &en) != 0) {
@@ -750,31 +805,55 @@ static void serve_client(int cfd)
         return;
     }
 
-    // NEW: /api/v1/control/cal?enabled=0|1&slope=-5.7&offset=21.0
+    /*
+     * /api/v1/control/cal
+     *
+     * MiniPH:
+     *   /api/v1/control/cal?enabled=1&vrefadc=4.096&opgain=5.25&ph7=2048&ph4=1286&phstep=59.16
+     *
+     * phstep optional: if omitted or <=0, daemon computes using Arduino formula.
+     */
     if (strcmp(path_only, "/api/v1/control/cal") == 0) {
-        int en = 0;
-        int have_en = (parse_int_param(path, "enabled", &en) == 0);
+        int enabled = -1;
+        (void)parse_int_param(path, "enabled", &enabled);
 
-        double slope = 0.0, offset = 0.0;
-        int have_slope = (parse_double_param(path, "slope", &slope) == 0);
-        int have_offset = (parse_double_param(path, "offset", &offset) == 0);
+        double vrefadc = 0.0, opgain = 0.0, phstep = 0.0;
+        int ph7 = 0, ph4 = 0;
 
-        if (!have_en && !have_slope && !have_offset) {
-            http_send_400(cfd, "provide enabled=0|1 and optionally slope=..&offset=..");
+        int have_vrefadc = (parse_double_param(path, "vrefadc", &vrefadc) == 0);
+        int have_opgain  = (parse_double_param(path, "opgain", &opgain) == 0);
+        int have_phstep  = (parse_double_param(path, "phstep", &phstep) == 0);
+        int have_ph7     = (parse_int_param(path, "ph7", &ph7) == 0);
+        int have_ph4     = (parse_int_param(path, "ph4", &ph4) == 0);
+
+        if (enabled == -1 && !have_vrefadc && !have_opgain && !have_phstep && !have_ph7 && !have_ph4) {
+            http_send_400(cfd, "provide enabled= and/or vrefadc/opgain/ph7/ph4/phstep");
             return;
         }
 
         pthread_mutex_lock(&g_lock);
-        if (have_en) g_cal.enabled = (en != 0);
-        if (have_slope) g_cal.slope = slope;
-        if (have_offset) g_cal.offset = offset;
+        if (enabled != -1) g_cal.enabled = (enabled != 0);
+        if (have_vrefadc) g_cal.vref_adc = vrefadc;
+        if (have_opgain)  g_cal.opamp_gain = opgain;
+        if (have_ph7)     g_cal.pH7Cal = ph7;
+        if (have_ph4)     g_cal.pH4Cal = ph4;
+        if (have_phstep)  g_cal.pHStep = phstep;
+
+        // Auto-compute pHStep if user did not provide it, or provided <= 0
+        if (!(g_cal.pHStep > 0.0) && (g_cal.pH7Cal > 0) && (g_cal.pH4Cal > 0) &&
+            (g_cal.vref_adc > 0.0) && (g_cal.opamp_gain > 0.0)) {
+            double auto_step = miniph_compute_phstep(g_cal.vref_adc, g_cal.pH7Cal, g_cal.pH4Cal, g_cal.opamp_gain);
+            if (auto_step > 0.0) g_cal.pHStep = auto_step;
+        }
+
         ph_cal_t cal = g_cal;
         pthread_mutex_unlock(&g_lock);
 
         char json[256];
         snprintf(json, sizeof(json),
-                 "{\"enabled\":%s,\"slope\":%.6f,\"offset\":%.6f}",
-                 cal.enabled ? "true" : "false", cal.slope, cal.offset);
+                "{\"enabled\":%s,\"vrefadc\":%.6f,\"opgain\":%.6f,\"ph7\":%d,\"ph4\":%d,\"phstep\":%.6f}",
+                cal.enabled ? "true" : "false",
+                cal.vref_adc, cal.opamp_gain, cal.pH7Cal, cal.pH4Cal, cal.pHStep);
         http_send(cfd, "application/json", json);
         return;
     }
@@ -817,22 +896,19 @@ static void serve_client(int cfd)
             "<div>Measured pH:</div><div><span id='phm'>-</span></div>"
             "<div>Actuator u:</div><div><span id='u'>-</span></div>"
             "</div>"
-
             "<label>Setpoint <input id='sp_in' type='number' step='0.01' min='0' max='14'></label>"
             "<div>"
             "<button onclick='setEnable(1)'>Enable</button>"
             "<button onclick='setEnable(0)'>Disable</button>"
             "<button onclick='applySP()'>Apply Setpoint</button>"
             "</div>"
-
             "<div>"
             "<button onclick='setSim(1)'>Sim On</button>"
             "<button onclick='setSim(0)'>Sim Off</button>"
             "</div>"
-
             "<div class='muted' style='margin-top:.5rem'>"
             "Sim toggle: /api/v1/control/sim?enabled=0|1<br>"
-            "Calibration: /api/v1/control/cal?enabled=1&slope=..&offset=.."
+            "MiniPH cal: /api/v1/control/cal?enabled=1&vrefadc=4.096&opgain=5.25&ph7=2048&ph4=1286&phstep=59.16"
             "</div>"
             "</div>"
             "</div>"
@@ -913,9 +989,6 @@ static void *http_thread(void *arg)
         serve_client(cfd);
         close(cfd);
     }
-
-    close(sfd);
-    return NULL;
 }
 
 static void usage(const char *argv0)
@@ -927,7 +1000,8 @@ static void usage(const char *argv0)
             "          [--sp 6.5] [--enable 0|1] [--sim 0|1]\n"
             "          [--kp 2.0] [--ki 0.5] [--u-max 0.4]\n"
             "          [--ph0 7.5] [--ph-eq 7.5] [--k-leak 0.05] [--k-u 0.2] [--noise 0.01]\n"
-            "          [--cal-enable 0|1] [--cal-slope X] [--cal-offset Y]\n",
+            "          [--cal-enable 0|1] [--cal-vrefadc 4.096] [--cal-opgain 5.25]\n"
+            "          [--cal-ph7 2048] [--cal-ph4 1286] [--cal-phstep 59.16]\n",
             argv0);
 }
 
@@ -945,8 +1019,8 @@ int main(int argc, char **argv)
 
     srand((unsigned)now_unix_ms());
 
-    // Defaults: tap-water-ish plant and conservative PI
     pthread_mutex_lock(&g_lock);
+
     memset(&g_latest, 0, sizeof(g_latest));
     g_latest.ts_unix_ms = now_unix_ms();
     g_latest.vref = cfg.vref;
@@ -977,9 +1051,13 @@ int main(int argc, char **argv)
     g_ctrl.ph_meas = NAN;
 
     memset(&g_cal, 0, sizeof(g_cal));
-    g_cal.enabled = 0;   // start disabled, enable when you have calibration
-    g_cal.slope = 0.0;
-    g_cal.offset = 0.0;
+    g_cal.enabled = 1;        // enable by default so you see pH immediately with defaults
+    g_cal.vref_adc = 4.096;   // MiniPH default
+    g_cal.opamp_gain = 5.25;  // from your sketch
+    g_cal.pH7Cal = 2048;
+    g_cal.pH4Cal = 1286;
+    g_cal.pHStep = 59.16;
+
     pthread_mutex_unlock(&g_lock);
 
     for (int i = 1; i < argc; i++) {
@@ -1046,20 +1124,38 @@ int main(int argc, char **argv)
             pthread_mutex_lock(&g_lock);
             g_ctrl.noise_sigma = fabs(ns);
             pthread_mutex_unlock(&g_lock);
-        } else if (!strcmp(argv[i], "--cal-enable") && i + 1 < argc) {
+        }
+
+        // Calibration CLI
+        else if (!strcmp(argv[i], "--cal-enable") && i + 1 < argc) {
             int en = atoi(argv[++i]);
             pthread_mutex_lock(&g_lock);
             g_cal.enabled = (en != 0);
             pthread_mutex_unlock(&g_lock);
-        } else if (!strcmp(argv[i], "--cal-slope") && i + 1 < argc) {
-            double s = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--cal-vrefadc") && i + 1 < argc) {
+            double v = atof(argv[++i]);
             pthread_mutex_lock(&g_lock);
-            g_cal.slope = s;
+            g_cal.vref_adc = v;
             pthread_mutex_unlock(&g_lock);
-        } else if (!strcmp(argv[i], "--cal-offset") && i + 1 < argc) {
-            double o = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--cal-opgain") && i + 1 < argc) {
+            double v = atof(argv[++i]);
             pthread_mutex_lock(&g_lock);
-            g_cal.offset = o;
+            g_cal.opamp_gain = v;
+            pthread_mutex_unlock(&g_lock);
+        } else if (!strcmp(argv[i], "--cal-ph7") && i + 1 < argc) {
+            int v = atoi(argv[++i]);
+            pthread_mutex_lock(&g_lock);
+            g_cal.pH7Cal = v;
+            pthread_mutex_unlock(&g_lock);
+        } else if (!strcmp(argv[i], "--cal-ph4") && i + 1 < argc) {
+            int v = atoi(argv[++i]);
+            pthread_mutex_lock(&g_lock);
+            g_cal.pH4Cal = v;
+            pthread_mutex_unlock(&g_lock);
+        } else if (!strcmp(argv[i], "--cal-phstep") && i + 1 < argc) {
+            double v = atof(argv[++i]);
+            pthread_mutex_lock(&g_lock);
+            g_cal.pHStep = v;
             pthread_mutex_unlock(&g_lock);
         } else {
             usage(argv[0]);
@@ -1067,12 +1163,11 @@ int main(int argc, char **argv)
         }
     }
 
-    // Update latest vref after CLI parsing
     pthread_mutex_lock(&g_lock);
     g_latest.vref = cfg.vref;
     pthread_mutex_unlock(&g_lock);
 
-    // Init DB schema once in main before threads start
+    // Init DB schema once before threads
     sqlite3 *db0 = NULL;
     if (db_open_only(&db0, cfg.db_path) != 0) {
         fprintf(stderr, "db_open_only failed in main for %s\n", cfg.db_path);
