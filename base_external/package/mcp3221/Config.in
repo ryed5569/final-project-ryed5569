@@ -1,4 +1,9 @@
 config BR2_PACKAGE_MCP3221
     bool "mcp3221 reader"
+    select BR2_PACKAGE_SQLITE
     help
-      Small userspace tool/daemon to read MCP3221 (12-bit) over i2c-dev.
+      Userspace tools for MCP3221 (12-bit) over i2c-dev.
+      Installs:
+        - mcp3221_read: CLI reader
+        - mcp3221d: daemon + JSON API + simple web UI
+
